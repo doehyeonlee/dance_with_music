@@ -37,6 +37,22 @@ class ChampModel(nn.Module):
         multi_guidance_cond,
         uncond_fwd: bool = False,
     ):
+        """
+        Forward pass of CHAMP Model
+        
+        Args:
+            noisy_latents: Input noisy latents [B, C, T, H, W]
+            timesteps: Diffusion timesteps [B]
+            ref_image_latents: Reference image latents [B, C, H, W]
+            clip_image_embeds: CLIP image embeddings [B, C, H, W]
+            multi_guidance_cond: Multiple guidance conditions [B, total_channels]
+            uncond_fwd: Whether to run unconditional forward pass
+            
+        Returns:
+            model_pred: Predicted denoised sample [B, C, T, H, W]
+            
+        Function: Processes multiple guidance types and generates video with reference control
+        """
         guidance_cond_group = torch.split(
             multi_guidance_cond, self.guidance_input_channels, dim=1
         )

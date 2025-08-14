@@ -406,18 +406,24 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         mid_block_additional_residual: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[UNet3DConditionOutput, Tuple]:
-        r"""
+        """
+        Forward pass of 3D UNet
+        
         Args:
-            sample (`torch.FloatTensor`): (batch, channel, height, width) noisy inputs tensor
-            timestep (`torch.FloatTensor` or `float` or `int`): (batch) timesteps
-            encoder_hidden_states (`torch.FloatTensor`): (batch, sequence_length, feature_dim) encoder hidden states
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`models.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
-
+            sample: Input noisy sample [B, C, T, H, W]
+            timestep: Current diffusion timestep [B] or float/int
+            encoder_hidden_states: CLIP image embeddings [B, seq_len, feature_dim]
+            class_labels: Optional class labels [B]
+            guidance_fea: Guidance features from music/pose [B, C, T, H, W]
+            attention_mask: Optional attention mask [B, seq_len]
+            down_block_additional_residuals: Additional residuals for down blocks
+            mid_block_additional_residual: Additional residual for mid block
+            return_dict: Whether to return dictionary format
+            
         Returns:
-            [`~models.unet_2d_condition.UNet2DConditionOutput`] or `tuple`:
-            [`~models.unet_2d_condition.UNet2DConditionOutput`] if `return_dict` is True, otherwise a `tuple`. When
-            returning a tuple, the first element is the sample tensor.
+            output: UNet output or tuple
+            
+        Function: 3D denoising network that integrates guidance features for video generation
         """
         # By default samples have to be AT least a multiple of the overall upsampling factor.
         # The overall upsampling factor is equal to 2 ** (# num of upsampling layears).

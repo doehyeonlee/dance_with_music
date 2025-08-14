@@ -203,11 +203,24 @@ class IntegratedChampModel(nn.Module):
         reference_image: torch.Tensor,
         noisy_latents: torch.Tensor,
         timesteps: torch.Tensor,
+        guidance_input: Optional[torch.Tensor] = None,  # Added: External guidance input
         use_m2p_guidance: bool = True,
         guidance_scale: float = 1.0
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass for Stage B: Image stage
+        Forward pass for Stage B: Image stage with proper Reference Control
+        
+        Architecture:
+        1. M2P Encoder: Music → Pose + Face
+        2. Reference Processing: Image → CLIP + VAE latents
+        3. Reference Control: Extract style information
+        4. Guidance Processing: Combine M2P predictions + External guidance
+        5. Denoising: Generate video with reference style + pose guidance
+        
+        Guidance Flow:
+        - M2P Guidance: Music → Pose heatmaps → Guidance Encoder → Denoising UNet
+        - External Guidance: Direct input → Guidance Encoder → Denoising UNet
+        - Combined: M2P + External guidance with configurable weights
         """
         # Get M2P predictions
         pose_logits, face_embed = self.m2p_encoder(music_features)
@@ -218,7 +231,7 @@ class IntegratedChampModel(nn.Module):
             clip_embeds = self.clip_encoder(reference_image)
         else:
             # Use face embedding as fallback
-            clip_embeds = face_embed.unsqueeze(1)  # [B, 1, embed_dim]
+            clip_embeds = face_embed.mean(dim=1).unsqueeze(1)  # [B, 1, embed_dim]
         
         # Encode reference image with VAE
         if self.vae_encoder is not None:
@@ -228,15 +241,59 @@ class IntegratedChampModel(nn.Module):
             # Dummy reference latents
             ref_latents = torch.randn_like(noisy_latents[:, :1])
         
-        # Create guidance condition
+        # IMPORTANT: Use Reference Control for style transfer
+        # This is the key innovation of CHAMP
+        if not hasattr(self, '_ref_control_initialized'):
+            self._ref_control_initialized = False
+        
+        if not self._ref_control_initialized:
+            # Initialize reference control with reference image
+            ref_timesteps = torch.zeros_like(timesteps)
+            self.reference_unet(
+                ref_latents,
+                ref_timesteps,
+                encoder_hidden_states=clip_embeds,
+                return_dict=False,
+            )
+            self.reference_control_reader.update(self.reference_control_writer)
+            self._ref_control_initialized = True
+        
+        # Create guidance condition from M2P pose predictions
         if use_m2p_guidance:
-            # Use M2P pose heatmap as guidance
-            guidance_cond = pose_heatmap.unsqueeze(1) * guidance_scale  # [B, 1, T, pose_channels]
+            # Process pose heatmap through guidance encoder
+            pose_guidance = self.guidance_encoder_group['pose'](pose_heatmap)
+            m2p_guidance_cond = pose_guidance * guidance_scale
         else:
             # Use random guidance
-            guidance_cond = torch.randn_like(pose_heatmap.unsqueeze(1))
+            m2p_guidance_cond = torch.randn_like(pose_heatmap.unsqueeze(1))
         
-        # CHAMP forward pass
+        # Process external guidance if provided
+        external_guidance_cond = None
+        if guidance_input is not None:
+            # External guidance should be in the same format as pose guidance
+            # Expected shape: [B, T, guidance_channels] or [B, T, H, W]
+            if guidance_input.dim() == 3:
+                # [B, T, guidance_channels] - direct guidance
+                external_guidance_cond = guidance_input
+            elif guidance_input.dim() == 4:
+                # [B, T, H, W] - spatial guidance, need to process
+                external_guidance_cond = self.guidance_encoder_group['pose'](guidance_input)
+            else:
+                raise ValueError(f"Unsupported guidance_input dimensions: {guidance_input.shape}")
+        
+        # Combine guidance conditions
+        if external_guidance_cond is not None:
+            # Combine M2P and external guidance with configurable weights
+            # You can adjust these weights based on your needs
+            m2p_weight = 0.7
+            external_weight = 0.3
+            guidance_cond = (m2p_weight * m2p_guidance_cond + 
+                           external_weight * external_guidance_cond)
+        else:
+            guidance_cond = m2p_guidance_cond
+        
+        # CHAMP forward pass with reference control
+        # The denoising UNet now has access to reference style information
         model_pred = self.denoising_unet(
             noisy_latents,
             timesteps,
@@ -249,7 +306,10 @@ class IntegratedChampModel(nn.Module):
             'pose_heatmap': pose_heatmap,
             'face_embed': face_embed,
             'ref_latents': ref_latents,
-            'clip_embeds': clip_embeds
+            'clip_embeds': clip_embeds,
+            'guidance_cond': guidance_cond,
+            'm2p_guidance': m2p_guidance_cond,
+            'external_guidance': external_guidance_cond
         }
     
     def forward_stage_c(
@@ -258,10 +318,28 @@ class IntegratedChampModel(nn.Module):
         reference_image: torch.Tensor,
         noisy_latents: torch.Tensor,
         timesteps: torch.Tensor,
+        guidance_input: Optional[torch.Tensor] = None,
         guidance_scale: float = 1.0
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for Stage C: Motion/Temporal stage
+        
+        Architecture:
+        1. M2P Encoder: Music → Pose + Face sequences
+        2. Reference Processing: Image → CLIP + VAE latents  
+        3. Reference Control: Extract style information
+        4. Guidance Processing: Combine M2P + External guidance
+        5. Denoising: Generate video with temporal consistency
+        
+        TODO: Additional Loss Functions to be implemented:
+        - Temporal Consistency Loss: Ensure smooth transitions between frames
+        - Motion Smoothness Loss: Penalize jerky movements
+        - Style Consistency Loss: Maintain consistent visual style across frames
+        - Identity Preservation Loss: Keep face identity consistent
+        - Pose Coherence Loss: Ensure logical pose sequences
+        - Audio-Visual Sync Loss: Align generated motion with music rhythm
+        
+        Loss weights will be configurable through training arguments
         """
         # Similar to Stage B but with temporal focus
         return self.forward_stage_b(
@@ -269,6 +347,7 @@ class IntegratedChampModel(nn.Module):
             reference_image=reference_image,
             noisy_latents=noisy_latents,
             timesteps=timesteps,
+            guidance_input=guidance_input,
             use_m2p_guidance=True,
             guidance_scale=guidance_scale
         )

@@ -8,6 +8,14 @@ class M2PEncoder(nn.Module):
     """
     Music-to-Pose Encoder with Face Embedding
     Generates pose heatmaps and face embeddings from music features
+    
+    Architecture:
+    Music Features [B, T, 4800] → Hidden Features [B, T, 1024] → 
+    Pose Output [B, T, 134] + Face Output [B, T, 512]
+    
+    Data Format (based on P00002):
+    - Face images: [B, T, 1, 640, 360] - Grayscale face images
+    - Pose images: [B, T, 3, 640, 360] - RGB pose skeleton images
     """
     
     def __init__(
@@ -27,9 +35,13 @@ class M2PEncoder(nn.Module):
         self.pose_channels = pose_channels
         self.face_embed_dim = face_embed_dim
         
-        # Music feature processing
+        # Music feature processing with dimension reduction
         self.music_proj = nn.Sequential(
-            nn.Linear(music_input_dim, hidden_dim),
+            nn.Linear(music_input_dim, hidden_dim * 2),  # 4800 → 2048
+            nn.LayerNorm(hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),      # 2048 → 1024
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout)
@@ -46,20 +58,24 @@ class M2PEncoder(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Pose prediction head
+        # Pose prediction head with dimension mapping
         self.pose_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, hidden_dim // 2),     # 1024 → 512
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, pose_channels)
+            nn.Linear(hidden_dim // 2, hidden_dim // 4), # 512 → 256
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 4, pose_channels)    # 256 → 134
         )
         
-        # Face embedding head
+        # Face embedding head with dimension mapping
+        # Modified to output per-frame embeddings instead of single embedding
         self.face_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, hidden_dim // 2),     # 1024 → 512
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, face_embed_dim)
+            nn.Linear(hidden_dim // 2, face_embed_dim)  # 512 → 512
         )
         
         # Initialize weights
@@ -89,40 +105,43 @@ class M2PEncoder(nn.Module):
             return_face_embed: Whether to return face embedding
             
         Returns:
-            pose_logits: Pose prediction logits [B, T, pose_channels]
-            face_embed: Face embedding [B, 512] or None
+            pose_logits: Pose prediction logits [B, T, 134]
+            face_embed: Face embedding [B, T, 512] or None
             
-        Function: Converts music features to pose predictions and face embeddings
-        """
-        """
-        Args:
-            music_features: [B, T, music_input_dim] - Music features over time
-            return_face_embed: Whether to return face embedding
-            
-        Returns:
-            pose_logits: [B, T, pose_channels] - Pose prediction logits
-            face_embed: [B, face_embed_dim] - Face embedding (if return_face_embed=True)
+        Dimension Flow:
+        1. Input: [B, T, 4800] - Music features
+        2. Projection: [B, T, 4800] → [B, T, 1024]
+        3. Transformer: [B, T, 1024] → [B, T, 1024]
+        4. Pose Head: [B, T, 1024] → [B, T, 134]
+        5. Face Head: [B, T, 1024] → [B, T, 512] (per-frame embeddings)
         """
         batch_size, seq_len, _ = music_features.shape
         
-        # Project music features
+        # Validate input dimensions
+        if music_features.size(-1) != self.music_input_dim:
+            raise ValueError(f"Expected music features dimension {self.music_input_dim}, got {music_features.size(-1)}")
+        
+        # Project music features: [B, T, 4800] → [B, T, 1024]
         x = self.music_proj(music_features)  # [B, T, hidden_dim]
         
         # Add positional encoding
         pos_encoding = self._get_pos_encoding(seq_len, self.hidden_dim).to(x.device)
         x = x + pos_encoding
         
-        # Apply transformer
+        # Apply transformer: [B, T, 1024] → [B, T, 1024]
         x = self.transformer(x)  # [B, T, hidden_dim]
         
-        # Pose prediction
+        # Pose prediction: [B, T, 1024] → [B, T, 134]
         pose_logits = self.pose_head(x)  # [B, T, pose_channels]
         
-        # Face embedding (use mean pooling over time)
+        # Face embedding: [B, T, 1024] → [B, T, 512]
         if return_face_embed:
-            face_embed = self.face_head(x.mean(dim=1))  # [B, face_embed_dim]
-            # L2 normalization for ArcFace compatibility
-            face_embed = F.normalize(face_embed, p=2, dim=1)
+            # Generate per-frame face embeddings (no pooling)
+            face_embed = self.face_head(x)  # [B, T, 512]
+            
+            # L2 normalization for each frame
+            face_embed = F.normalize(face_embed, p=2, dim=-1)
+            
             return pose_logits, face_embed
         else:
             return pose_logits, None
@@ -140,36 +159,73 @@ class M2PEncoder(nn.Module):
         return pe
     
     def get_pose_heatmap(self, pose_logits: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
-        """Convert pose logits to heatmap using softmax"""
+        """
+        Convert pose logits to heatmap using softmax
+        
+        Args:
+            pose_logits: [B, T, 134] - Pose prediction logits
+            temperature: Temperature for softmax scaling
+            
+        Returns:
+            heatmap: [B, T, 134] - Normalized pose probabilities
+        """
         # Apply temperature scaling and softmax
         heatmap = F.softmax(pose_logits / temperature, dim=-1)
         return heatmap
     
     def get_pose_coordinates(self, pose_logits: torch.Tensor, temperature: float = 0.1) -> torch.Tensor:
-        """Convert pose logits to coordinates using soft-argmax"""
+        """
+        Convert pose logits to coordinates using soft-argmax
+        
+        Args:
+            pose_logits: [B, T, 134] - Pose prediction logits
+            temperature: Temperature for softmax scaling
+            
+        Returns:
+            coordinates: [B, T, 134, 2] - X,Y coordinates for each joint
+        """
         heatmap = self.get_pose_heatmap(pose_logits, temperature)
         
-        # Soft-argmax: weighted average of positions
-        batch_size, seq_len, num_joints = heatmap.shape
-        heatmap = heatmap.view(batch_size, seq_len, num_joints, -1)  # Reshape for spatial dimensions
+        # For 134 joints, we'll create a reasonable spatial layout
+        # Assuming joints can be arranged in a grid-like structure
+        num_joints = heatmap.size(-1)
         
-        # Create coordinate grid
-        h, w = int(math.sqrt(num_joints)), int(math.sqrt(num_joints))
-        if h * w != num_joints:
-            # If not perfect square, pad or truncate
-            h = w = int(math.ceil(math.sqrt(num_joints)))
-            heatmap = heatmap[:, :, :num_joints, :]
+        # Create a reasonable grid size (e.g., 12x12 = 144, but we have 134)
+        grid_size = int(math.ceil(math.sqrt(num_joints)))
+        
+        # Pad or truncate to fit the grid
+        if grid_size * grid_size > num_joints:
+            # Pad with zeros
+            padding_size = grid_size * grid_size - num_joints
+            heatmap_padded = F.pad(heatmap, (0, padding_size), value=0)
+        else:
+            heatmap_padded = heatmap[:, :, :grid_size * grid_size]
+        
+        # Reshape to spatial dimensions: [B, T, 134] → [B, T, 134, H, W]
+        heatmap_spatial = heatmap_padded.view(heatmap.size(0), heatmap.size(1), -1, grid_size, grid_size)
         
         # Generate coordinate grid
-        y_coords = torch.arange(h, dtype=torch.float32, device=heatmap.device).view(1, 1, 1, h, 1)
-        x_coords = torch.arange(w, dtype=torch.float32, device=heatmap.device).view(1, 1, 1, 1, w)
+        y_coords = torch.arange(grid_size, dtype=torch.float32, device=heatmap.device).view(1, 1, 1, grid_size, 1)
+        x_coords = torch.arange(grid_size, dtype=torch.float32, device=heatmap.device).view(1, 1, 1, 1, grid_size)
         
-        # Weighted average
-        y_coord = (heatmap * y_coords).sum(dim=(3, 4))  # [B, T, num_joints]
-        x_coord = (heatmap * x_coords).sum(dim=(3, 4))  # [B, T, num_joints]
+        # Weighted average to get coordinates
+        y_coord = (heatmap_spatial * y_coords).sum(dim=(3, 4))  # [B, T, num_joints]
+        x_coord = (heatmap_spatial * x_coords).sum(dim=(3, 4))  # [B, T, num_joints]
         
-        coordinates = torch.stack([x_coord, y_coord], dim=-1)  # [B, T, num_joints, 2]
-        return coordinates
+        # Stack coordinates: [B, T, 134, 2]
+        coordinates = torch.stack([x_coord, y_coord], dim=-1)
+        
+        # Return only the original number of joints
+        return coordinates[:, :, :num_joints, :]
+    
+    def get_output_dimensions(self) -> dict:
+        """Get output dimensions for debugging and validation"""
+        return {
+            'pose_output': (self.pose_channels,),  # 134
+            'face_output': (self.face_embed_dim,),  # 512
+            'hidden_dim': self.hidden_dim,  # 1024
+            'music_input_dim': self.music_input_dim  # 4800
+        }
 
 
 class ArcFaceLoss(nn.Module):
@@ -245,54 +301,121 @@ class PoseLoss(nn.Module):
         Pose Loss calculation
         
         Args:
-            pred_logits: Predicted pose logits [B, T, pose_channels]
-            target_heatmap: Target pose heatmaps [B, T, 134, H, W]
+            pred_logits: Predicted pose logits [B, T, 134]
+            target_heatmap: Target pose heatmaps [B, T, 134] or [B, T, 134, H, W]
             target_coords: Target pose coordinates [B, T, 134, 2] (optional)
             
         Returns:
             total_loss: Combined pose loss value
             
-        Function: Calculates heatmap, coordinate, and temporal consistency losses
+        Dimension Handling:
+        - pred_logits: [B, T, 134] - Raw logits from M2P encoder
+        - target_heatmap: [B, T, 134] - Class labels or [B, T, 134, H, W] - Spatial heatmaps
+        - target_coords: [B, T, 134, 2] - X,Y coordinates for each joint
         """
-        """
-        Args:
-            pred_logits: [B, T, pose_channels] - Predicted pose logits
-            target_heatmap: [B, T, pose_channels] - Target heatmap
-            target_coords: [B, T, pose_channels, 2] - Target coordinates (optional)
+        batch_size, seq_len, num_joints = pred_logits.shape
+        
+        # Validate dimensions
+        if pred_logits.size(-1) != 134:
+            raise ValueError(f"Expected 134 pose channels, got {pred_logits.size(-1)}")
+        
+        # Handle different target formats
+        if target_heatmap.dim() == 3:  # [B, T, 134] - Class labels
+            # Cross-entropy loss for classification
+            heatmap_loss = F.cross_entropy(
+                pred_logits.view(-1, num_joints),  # [B*T, 134]
+                target_heatmap.view(-1)            # [B*T]
+            )
+        elif target_heatmap.dim() == 5:  # [B, T, 134, H, W] - Spatial heatmaps
+            # Convert logits to spatial heatmaps and compute MSE
+            pred_heatmap = F.softmax(pred_logits, dim=-1)  # [B, T, 134]
             
-        Returns:
-            total_loss: Combined pose loss
-        """
-        # Heatmap loss (Cross-entropy)
-        heatmap_loss = F.cross_entropy(
-            pred_logits.view(-1, pred_logits.size(-1)),
-            target_heatmap.view(-1)
-        )
+            # Reshape target to match prediction format
+            target_flat = target_heatmap.view(batch_size, seq_len, num_joints, -1)  # [B, T, 134, H*W]
+            target_flat = target_flat.mean(dim=-1)  # [B, T, 134] - Average over spatial dimensions
+            
+            heatmap_loss = F.mse_loss(pred_heatmap, target_flat)
+        else:
+            raise ValueError(f"Unsupported target_heatmap dimensions: {target_heatmap.shape}")
         
         total_loss = self.heatmap_weight * heatmap_loss
         
         # Coordinate loss (if coordinates provided)
         if target_coords is not None:
-            pred_coords = self._get_pose_coordinates(pred_logits)
+            # Validate coordinate dimensions
+            if target_coords.shape[-1] != 2:
+                raise ValueError(f"Expected 2D coordinates, got {target_coords.shape[-1]}")
+            
+            # Get predicted coordinates from logits
+            pred_coords = self._get_pose_coordinates(pred_logits)  # [B, T, 134, 2]
+            
+            # Ensure dimensions match
+            if pred_coords.shape != target_coords.shape:
+                raise ValueError(f"Coordinate shape mismatch: pred {pred_coords.shape} vs target {target_coords.shape}")
+            
             coord_loss = F.mse_loss(pred_coords, target_coords)
             total_loss += self.coordinate_weight * coord_loss
         
         # Temporal consistency loss
-        if pred_logits.size(1) > 1:
+        if seq_len > 1:
             temp_loss = self._temporal_consistency_loss(pred_logits)
             total_loss += self.temporal_weight * temp_loss
         
         return total_loss
     
     def _get_pose_coordinates(self, logits: torch.Tensor) -> torch.Tensor:
-        """Helper to get coordinates from logits"""
-        # This is a simplified version - in practice, you'd use the M2PEncoder method
-        heatmap = F.softmax(logits, dim=-1)
-        # Convert to coordinates (simplified)
-        return heatmap.mean(dim=-1, keepdim=True).expand(-1, -1, -1, 2)
+        """
+        Helper to get coordinates from logits
+        
+        Args:
+            logits: [B, T, 134] - Pose prediction logits
+            
+        Returns:
+            coordinates: [B, T, 134, 2] - X,Y coordinates for each joint
+        """
+        # Convert logits to probabilities
+        heatmap = F.softmax(logits, dim=-1)  # [B, T, 134]
+        
+        # For 134 joints, create a reasonable spatial layout
+        num_joints = heatmap.size(-1)
+        grid_size = int(math.ceil(math.sqrt(num_joints)))
+        
+        # Pad heatmap to fit grid
+        if grid_size * grid_size > num_joints:
+            padding_size = grid_size * grid_size - num_joints
+            heatmap_padded = F.pad(heatmap, (0, padding_size), value=0)
+        else:
+            heatmap_padded = heatmap[:, :, :grid_size * grid_size]
+        
+        # Reshape to spatial dimensions
+        heatmap_spatial = heatmap_padded.view(heatmap.size(0), heatmap.size(1), -1, grid_size, grid_size)
+        
+        # Generate coordinate grid
+        y_coords = torch.arange(grid_size, dtype=torch.float32, device=heatmap.device).view(1, 1, 1, grid_size, 1)
+        x_coords = torch.arange(grid_size, dtype=torch.float32, device=heatmap.device).view(1, 1, 1, 1, grid_size)
+        
+        # Weighted average to get coordinates
+        y_coord = (heatmap_spatial * y_coords).sum(dim=(3, 4))  # [B, T, num_joints]
+        x_coord = (heatmap_spatial * x_coords).sum(dim=(3, 4))  # [B, T, num_joints]
+        
+        # Stack coordinates and return only original joints
+        coordinates = torch.stack([x_coord, y_coord], dim=-1)  # [B, T, num_joints, 2]
+        return coordinates[:, :, :num_joints, :]
     
     def _temporal_consistency_loss(self, logits: torch.Tensor) -> torch.Tensor:
-        """Temporal consistency loss"""
+        """
+        Temporal consistency loss
+        
+        Args:
+            logits: [B, T, 134] - Pose prediction logits
+            
+        Returns:
+            temporal_loss: Scalar temporal consistency loss
+        """
         # Compute difference between consecutive frames
-        diff = logits[:, 1:] - logits[:, :-1]
-        return torch.mean(torch.abs(diff))
+        diff = logits[:, 1:] - logits[:, :-1]  # [B, T-1, 134]
+        
+        # L2 norm of temporal differences
+        temporal_loss = torch.mean(torch.norm(diff, p=2, dim=-1))
+        
+        return temporal_loss

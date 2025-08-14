@@ -1,0 +1,24 @@
+CUDA_VISIBLE_DEVICES=0 python inference_op.py \
+ --pretrained_model_name_or_path="path/stable-video-diffusion-img2vid-xt" \
+ --output_dir="path/op_infer" \
+ --validation_control_folder="path/inference/case-1/poses" \
+ --validation_image="path/inference/case-15/reference.png" \
+ --validation_image_mask="path/inference/case-15/reference_mask.png" \
+ --validation_control_mask_folder="path/inference/case-15/faces" \
+ --width=512 \
+ --height=512 \
+ --guidance_scale=3.0 \
+ --num_inference_steps=25 \
+ --posenet_model_name_or_path="path/checkpoints/Animation/pose_net.pth" \
+ --face_encoder_model_name_or_path="path/checkpoints/Animation/face_encoder.pth" \
+ --unet_model_name_or_path="path/checkpoints/Animation/unet.pth" \
+ --face_embedding_extractor_weight_path="path/checkpoints/Animation/glintr100_torch.pth" \
+ --num_optimization_iter=3 \
+ --start_refine_step=0 \
+ --end_refine_step=20 \
+ --max_frame_num=16 \
+ --batch_frames=16 \
+ --overlap=4 \
+ --noise_aug_strength=0.02 \
+ --frames_overlap=4 \
+ --gradient_checkpointing
